@@ -1,14 +1,18 @@
 #!/usr/bin/env python
 
 import os.path
+import threading
 
 import time
 import logging
 import argparse
+
+import re
 import requests
 import xml.etree.ElementTree
 import copy
 
+from requests.exceptions import ConnectionError
 from termcolor import colored
 
 logging.VERBOSE = (logging.INFO + logging.DEBUG) // 2
@@ -109,24 +113,43 @@ class DashProxy(HasLogger):
         self.i_refresh = 0
 
         self.downloaders = {}
+        self.stop = False
 
     def run(self):
         logger.log(logging.INFO, 'Running dash proxy for stream %s. Output goes in %s' % (self.mpd, self.output_dir))
-        self.refresh_mpd()
+        i = 0
+        while not self.stop:
+            logger.info('get mpd')
+            success = False
+            max_tries = 5
+            current_try = 0
+            while not success and current_try < max_tries:
+                try:
+                    r = requests.get(self.mpd)
+                    if r.status_code < 200 or r.status_code >= 300:
+                        logger.error('Cannot GET the MPD. Server returned %s. Retry %d' % (r.status_code, current_try))
+                        current_try = current_try + 1
+                except ConnectionError:
+                    logger.error('Connection error. Retry %d' % current_try)
+                    current_try = current_try + 1
+                else:
+                    success = True
+                    xml.etree.ElementTree.register_namespace('', ns['mpd'])
+                    mpd = xml.etree.ElementTree.fromstring(r.text)
+                    thread = threading.Thread(target=self.handle_mpd, args=(mpd,))
+                    thread.start()
+                    logger.info('thread %d created' % i)
+                    i = i+1
 
-    def refresh_mpd(self, after=0):
-        self.i_refresh += 1
-        if after>0:
-            time.sleep(after)
-
-        r = requests.get(self.mpd)
-        if r.status_code < 200 or r.status_code >= 300:
-            logger.log(logging.WARNING, 'Cannot GET the MPD. Server returned %s. Retrying after %ds' % (r.status_code, retry_interval))
-            self.refresh_mpd(after=retry_interval)
-
-        xml.etree.ElementTree.register_namespace('', ns['mpd'])
-        mpd = xml.etree.ElementTree.fromstring(r.text)
-        self.handle_mpd(mpd)
+                    minimum_update_period = mpd.attrib.get('minimumUpdatePeriod', '0')
+                    if minimum_update_period:
+                        minimum_update_period = int(re.search('\d+',minimum_update_period).group(0)) + 1
+                        time.sleep(minimum_update_period)
+                    else:
+                        self.info('VOD MPD. Nothing more to do. Stopping...')
+                        self.stop = True
+            if not success:
+                self.stop = True
 
     def get_base_url(self, mpd):
         base_url = baseUrl(self.mpd)
@@ -145,8 +168,8 @@ class DashProxy(HasLogger):
         original_mpd = copy.deepcopy(mpd)
 
         periods = mpd.findall('mpd:Period', ns)
-        logger.log(logging.INFO, 'mpd=%s' % (periods,))
-        logger.log(logging.VERBOSE, 'Found %d periods choosing the 1st one' % (len(periods),))
+        logger.debug('mpd=%s' % (periods,))
+        logger.debug('Found %d periods choosing the 1st one' % (len(periods),))
         period = periods[0]
         for as_idx, adaptation_set in enumerate( period.findall('mpd:AdaptationSet', ns) ):
             max_bandwidth = 0
@@ -160,14 +183,7 @@ class DashProxy(HasLogger):
             rep_addr = RepAddr(0, as_idx, max_rep_idx)
             self.ensure_downloader(mpd, rep_addr)
 
-        self.write_output_mpd(original_mpd)
-
-        minimum_update_period = mpd.attrib.get('minimumUpdatePeriod', '')
-        if minimum_update_period:
-            # TODO parse minimum_update_period
-            self.refresh_mpd(after=10)
-        else:
-            self.info('VOD MPD. Nothing more to do. Stopping...')
+        #self.write_output_mpd(original_mpd)
 
     def ensure_downloader(self, mpd, rep_addr):
         if rep_addr in self.downloaders:
@@ -176,7 +192,8 @@ class DashProxy(HasLogger):
             self.info('Starting a downloader for %s' % (rep_addr,))
             downloader = DashDownloader(self, rep_addr)
             self.downloaders[rep_addr] = downloader
-            downloader.handle_mpd(mpd, self.get_base_url(mpd))
+            if downloader.handle_mpd(mpd, self.get_base_url(mpd)):
+                self.stop = True
 
     def write_output_mpd(self, mpd):
         self.info('Writing the update MPD file')
@@ -235,19 +252,24 @@ class DashDownloader(HasLogger):
             else:
                 next_time = current_time
             next_time += int(segment.attrib.get('d', '0'))
-            self.download_template(media_template, rep, segment)
+            if self.download_template(media_template, rep, segment):
+                return True
 
     def download_template(self, template, representation=None, segment=None):
-        dest = self.render_template(template, representation, segment)
-        dest_url = self.full_url(dest)
-        dest = dest[dest.rfind('/')+1:]
-        self.info('requesting %s from %s' % (dest, dest_url))
-        r = requests.get(dest_url)
-        if r.status_code >= 200 and r.status_code < 300:
-            self.write(dest, r.content)
-
+        dest_filename = self.render_template(template, representation, segment)
+        local_filename = dest_filename[dest_filename.rfind('/')+1:]
+        if os.path.isfile(os.path.join(self.proxy.output_dir, local_filename)):
+            self.debug('File %s already exists' % local_filename)
         else:
-            self.error('cannot download %s server returned %d' % (dest_url, r.status_code))
+            dest_url = self.full_url(dest_filename)
+            self.debug('requesting %s from %s' % (local_filename, dest_url))
+            r = requests.get(dest_url)
+            if r.status_code >= 200 and r.status_code < 300:
+                self.write(local_filename, r.content)
+            else:
+                self.error('cannot download %s server returned %d' % (dest_url, r.status_code))
+                if r.status_code == 410:
+                    return True
 
     def render_template(self, template, representation=None, segment=None):
         template = template.replace('$RepresentationID$', '{representation_id}')

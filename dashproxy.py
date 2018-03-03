@@ -149,10 +149,16 @@ class DashProxy(HasLogger):
         logger.log(logging.VERBOSE, 'Found %d periods choosing the 1st one' % (len(periods),))
         period = periods[0]
         for as_idx, adaptation_set in enumerate( period.findall('mpd:AdaptationSet', ns) ):
+            max_bandwidth = 0
+            max_rep_idx = 0
             for rep_idx, representation in enumerate( adaptation_set.findall('mpd:Representation', ns) ):
-                self.verbose('Found representation with id %s' % (representation.attrib.get('id', 'UKN'),))
-                rep_addr = RepAddr(0, as_idx, rep_idx)
-                self.ensure_downloader(mpd, rep_addr)
+                cur_bandwidth = int(representation.attrib.get('bandwidth'))
+                if cur_bandwidth > max_bandwidth:
+                    max_bandwidth = cur_bandwidth
+                    max_rep_idx = rep_idx
+            self.verbose('Found representation with id %s' % max_rep_idx)
+            rep_addr = RepAddr(0, as_idx, max_rep_idx)
+            self.ensure_downloader(mpd, rep_addr)
 
         self.write_output_mpd(original_mpd)
 
@@ -234,6 +240,7 @@ class DashDownloader(HasLogger):
     def download_template(self, template, representation=None, segment=None):
         dest = self.render_template(template, representation, segment)
         dest_url = self.full_url(dest)
+        dest = dest[dest.rfind('/')+1:]
         self.info('requesting %s from %s' % (dest, dest_url))
         r = requests.get(dest_url)
         if r.status_code >= 200 and r.status_code < 300:

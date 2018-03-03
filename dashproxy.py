@@ -108,6 +108,8 @@ class DashProxy(HasLogger):
 
         self.mpd = mpd
         self.output_dir = output_dir
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
         self.download = download
         self.save_mpds = save_mpds
         self.i_refresh = 0

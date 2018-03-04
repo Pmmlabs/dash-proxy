@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# coding=utf-8
 
 import os.path
 import threading
@@ -19,7 +20,7 @@ logging.VERBOSE = (logging.INFO + logging.DEBUG) // 2
 
 logger = logging.getLogger('dash-proxy')
 
-ns = {'mpd':'urn:mpeg:dash:schema:mpd:2011'}
+ns = {'mpd': 'urn:mpeg:dash:schema:mpd:2011'}
 
 
 class Formatter(logging.Formatter):
@@ -40,18 +41,13 @@ class Formatter(logging.Formatter):
             return record.msg
 
 
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-formatter = Formatter()
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-
 def baseUrl(url):
     idx = url.rfind('/')
     if idx >= 0:
-        return url[:idx+1]
+        return url[:idx + 1]
     else:
         return url
+
 
 class RepAddr(object):
     def __init__(self, period_idx, adaptation_set_idx, representation_idx):
@@ -85,6 +81,15 @@ class MpdLocator(object):
 
 
 class HasLogger(object):
+    def __init__(self):
+        self.logger = logger
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.DEBUG)
+        formatter = Formatter()
+        ch.setFormatter(formatter)
+        self.logger.addHandler(ch)
+        super(HasLogger, self).__init__()
+
     def verbose(self, msg):
         self.logger.log(logging.VERBOSE, msg)
 
@@ -100,11 +105,11 @@ class HasLogger(object):
     def error(self, msg):
         self.logger.log(logging.ERROR, msg)
 
+
 class DashProxy(HasLogger):
-
-    def __init__(self, mpd, output_dir, download, save_mpds=False):
-        self.logger = logger
-
+    def __init__(self, mpd, output_dir, download, save_mpds=False, verbose=False):
+        super(DashProxy, self).__init__()
+        logger.setLevel(logging.VERBOSE if verbose else logging.INFO)
         self.mpd = mpd
         self.output_dir = output_dir
         if not os.path.isdir(output_dir):
@@ -126,10 +131,10 @@ class DashProxy(HasLogger):
                     r = requests.get(self.mpd)
                     if r.status_code < 200 or r.status_code >= 300:
                         logger.warning('Cannot GET the MPD. Server returned %s. Retry %d' % (r.status_code, current_try))
-                        current_try = current_try + 1
+                        current_try += 1
                 except ConnectionError:
                     logger.error('Connection error. Retry %d' % current_try)
-                    current_try = current_try + 1
+                    current_try += 1
                 else:
                     success = True
                     xml.etree.ElementTree.register_namespace('', ns['mpd'])
@@ -138,7 +143,7 @@ class DashProxy(HasLogger):
 
                     minimum_update_period = mpd.attrib.get('minimumUpdatePeriod', '0')
                     if minimum_update_period:
-                        minimum_update_period = int(re.search('\d+',minimum_update_period).group(0)) + 1
+                        minimum_update_period = int(re.search('\d+', minimum_update_period).group(0)) + 1
                         time.sleep(minimum_update_period)
                     else:
                         self.info('VOD MPD. Nothing more to do. Stopping...')
@@ -151,12 +156,12 @@ class DashProxy(HasLogger):
         location = mpd.find('mpd:Location', ns)
         if location is not None:
             base_url = baseUrl(location.text)
-        baseUrlNode = mpd.find('mpd:BaseUrl', ns)
-        if baseUrlNode:
-            if baseUrlNode.text.startswith('http://') or baseUrlNode.text.startswith('https://'):
-                base_url = baseUrl(baseUrlNode.text)
+        base_url_node = mpd.find('mpd:BaseUrl', ns)
+        if base_url_node:
+            if base_url_node.text.startswith('http://') or base_url_node.text.startswith('https://'):
+                base_url = baseUrl(base_url_node.text)
             else:
-                base_url = base_url + baseUrlNode.text
+                base_url = base_url + base_url_node.text
         return base_url
 
     def handle_mpd(self, mpd):
@@ -166,10 +171,10 @@ class DashProxy(HasLogger):
         logger.debug('mpd=%s' % (periods,))
         logger.debug('Found %d periods choosing the 1st one' % (len(periods),))
         period = periods[0]
-        for as_idx, adaptation_set in enumerate( period.findall('mpd:AdaptationSet', ns) ):
+        for as_idx, adaptation_set in enumerate(period.findall('mpd:AdaptationSet', ns)):
             max_bandwidth = 0
             max_rep_idx = 0
-            for rep_idx, representation in enumerate( adaptation_set.findall('mpd:Representation', ns) ):
+            for rep_idx, representation in enumerate(adaptation_set.findall('mpd:Representation', ns)):
                 cur_bandwidth = int(representation.attrib.get('bandwidth'))
                 if cur_bandwidth > max_bandwidth:
                     max_bandwidth = cur_bandwidth
@@ -180,7 +185,7 @@ class DashProxy(HasLogger):
             if self.process_mpd(mpd, rep_addr):
                 self.stop = True
 
-        #self.write_output_mpd(original_mpd)
+        # self.write_output_mpd(original_mpd)
 
     def write_output_mpd(self, mpd):
         self.info('Writing the update MPD file')
@@ -210,14 +215,14 @@ class DashProxy(HasLogger):
         segments = copy.deepcopy(segment_timeline.findall('mpd:S', ns))
         idx = 0
         for segment in segments:
-            duration = int( segment.attrib.get('d', '0') )
-            repeat = int( segment.attrib.get('r', '0') )
-            idx = idx + 1
+            duration = int(segment.attrib.get('d', '0'))
+            repeat = int(segment.attrib.get('r', '0'))
+            idx += 1
             for _ in range(0, repeat):
-                elem = xml.etree.ElementTree.Element('{urn:mpeg:dash:schema:mpd:2011}S', attrib={'d':duration})
+                elem = xml.etree.ElementTree.Element('{urn:mpeg:dash:schema:mpd:2011}S', attrib={'d': duration})
                 segment_timeline.insert(idx, elem)
                 self.verbose('appding a new elem')
-                idx = idx + 1
+                idx += 1
 
         media_template = segment_template.attrib.get('media', '')
         next_time = 0
@@ -232,8 +237,8 @@ class DashProxy(HasLogger):
 
     def download_template(self, template, representation=None, segment=None):
         dest_filename = self.render_template(template, representation, segment)
-        local_filename = dest_filename[dest_filename.rfind('/')+1:]
-        if not(dest_filename in self.downloaded):
+        local_filename = dest_filename[dest_filename.rfind('/') + 1:]
+        if not (dest_filename in self.downloaded):
             self.downloaded.append(dest_filename)
             dest_url = self.full_url(dest_filename)
             threading.Thread(target=self.download, args=(dest_url, local_filename)).start()
@@ -241,14 +246,15 @@ class DashProxy(HasLogger):
     def download(self, dest_url, local_filename):
         self.info('requesting %s from %s' % (local_filename, dest_url))
         r = requests.get(dest_url)
-        if r.status_code >= 200 and r.status_code < 300:
+        if 200 <= r.status_code < 300:
             self.write(local_filename, r.content)
         else:
             self.error('cannot download %s server returned %d' % (dest_url, r.status_code))
             if r.status_code == 410:
                 self.stop = True
 
-    def render_template(self, template, representation=None, segment=None):
+    @staticmethod
+    def render_template(template, representation=None, segment=None):
         template = template.replace('$RepresentationID$', '{representation_id}')
         template = template.replace('$Time$', '{time}')
 
@@ -262,7 +268,7 @@ class DashProxy(HasLogger):
         return template
 
     def full_url(self, dest):
-        return self.mpd_base_url + dest # TODO remove hardcoded arrd
+        return self.mpd_base_url + dest  # TODO remove hardcoded arrd
 
     def write(self, dest, content):
         dest = dest.split('?')[0]
@@ -273,12 +279,13 @@ class DashProxy(HasLogger):
 
 
 def run(args):
-    logger.setLevel(logging.VERBOSE if args.v else logging.INFO)
     proxy = DashProxy(mpd=args.mpd,
-                  output_dir=args.o,
-                  download=args.d,
-                  save_mpds=args.save_individual_mpds)
+                      output_dir=args.o,
+                      download=args.d,
+                      save_mpds=args.save_individual_mpds,
+                      verbose=args.v)
     return proxy.run()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -290,6 +297,7 @@ def main():
     args = parser.parse_args()
 
     run(args)
+
 
 if __name__ == '__main__':
     main()

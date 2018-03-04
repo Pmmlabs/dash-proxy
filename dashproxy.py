@@ -101,7 +101,6 @@ class HasLogger(object):
         self.logger.log(logging.ERROR, msg)
 
 class DashProxy(HasLogger):
-    retry_interval = 10
 
     def __init__(self, mpd, output_dir, download, save_mpds=False):
         self.logger = logger
@@ -110,18 +109,15 @@ class DashProxy(HasLogger):
         self.output_dir = output_dir
         if not os.path.isdir(output_dir):
             os.makedirs(output_dir)
-        self.download = download
         self.save_mpds = save_mpds
         self.i_refresh = 0
-
-        self.downloaders = {}
         self.stop = False
+        self.downloaded = []
+        self.mpd_base_url = None
 
     def run(self):
         logger.log(logging.INFO, 'Running dash proxy for stream %s. Output goes in %s' % (self.mpd, self.output_dir))
-        i = 0
         while not self.stop:
-            logger.info('get mpd')
             success = False
             max_tries = 5
             current_try = 0
@@ -129,7 +125,7 @@ class DashProxy(HasLogger):
                 try:
                     r = requests.get(self.mpd)
                     if r.status_code < 200 or r.status_code >= 300:
-                        logger.error('Cannot GET the MPD. Server returned %s. Retry %d' % (r.status_code, current_try))
+                        logger.warning('Cannot GET the MPD. Server returned %s. Retry %d' % (r.status_code, current_try))
                         current_try = current_try + 1
                 except ConnectionError:
                     logger.error('Connection error. Retry %d' % current_try)
@@ -138,10 +134,7 @@ class DashProxy(HasLogger):
                     success = True
                     xml.etree.ElementTree.register_namespace('', ns['mpd'])
                     mpd = xml.etree.ElementTree.fromstring(r.text)
-                    thread = threading.Thread(target=self.handle_mpd, args=(mpd,))
-                    thread.start()
-                    logger.info('thread %d created' % i)
-                    i = i+1
+                    self.handle_mpd(mpd)
 
                     minimum_update_period = mpd.attrib.get('minimumUpdatePeriod', '0')
                     if minimum_update_period:
@@ -167,7 +160,7 @@ class DashProxy(HasLogger):
         return base_url
 
     def handle_mpd(self, mpd):
-        original_mpd = copy.deepcopy(mpd)
+        # original_mpd = copy.deepcopy(mpd)
 
         periods = mpd.findall('mpd:Period', ns)
         logger.debug('mpd=%s' % (periods,))
@@ -183,19 +176,11 @@ class DashProxy(HasLogger):
                     max_rep_idx = rep_idx
             self.verbose('Found representation with id %s' % max_rep_idx)
             rep_addr = RepAddr(0, as_idx, max_rep_idx)
-            self.ensure_downloader(mpd, rep_addr)
+            self.debug('Starting a downloader for %s' % (rep_addr,))
+            if self.process_mpd(mpd, rep_addr):
+                self.stop = True
 
         #self.write_output_mpd(original_mpd)
-
-    def ensure_downloader(self, mpd, rep_addr):
-        if rep_addr in self.downloaders:
-            self.verbose('A downloader for %s already started' % (rep_addr,))
-        else:
-            self.info('Starting a downloader for %s' % (rep_addr,))
-            downloader = DashDownloader(self, rep_addr)
-            self.downloaders[rep_addr] = downloader
-            if downloader.handle_mpd(mpd, self.get_base_url(mpd)):
-                self.stop = True
 
     def write_output_mpd(self, mpd):
         self.info('Writing the update MPD file')
@@ -210,27 +195,16 @@ class DashProxy(HasLogger):
             with open(dest, 'wt') as f:
                 f.write(content)
 
+    def process_mpd(self, mpd, rep_addr):
+        self.mpd_base_url = self.get_base_url(mpd)
+        mpd = MpdLocator(mpd)
 
-class DashDownloader(HasLogger):
-    def __init__(self, proxy, rep_addr):
-        self.logger = logger
-        self.proxy = proxy
-        self.rep_addr = rep_addr
-        self.mpd_base_url = ''
-
-        self.initialization_downloaded = False
-
-    def handle_mpd(self, mpd, base_url):
-        self.mpd_base_url = base_url
-        self.mpd = MpdLocator(mpd)
-
-        rep = self.mpd.representation(self.rep_addr)
-        segment_template = self.mpd.segment_template(self.rep_addr)
-        segment_timeline = self.mpd.segment_timeline(self.rep_addr)
+        rep = mpd.representation(rep_addr)
+        segment_template = mpd.segment_template(rep_addr)
+        segment_timeline = mpd.segment_timeline(rep_addr)
 
         initialization_template = segment_template.attrib.get('initialization', '')
-        if initialization_template and not self.initialization_downloaded:
-            self.initialization_downloaded = True
+        if initialization_template:
             self.download_template(initialization_template, rep)
 
         segments = copy.deepcopy(segment_timeline.findall('mpd:S', ns))
@@ -246,7 +220,7 @@ class DashDownloader(HasLogger):
                 idx = idx + 1
 
         media_template = segment_template.attrib.get('media', '')
-        nex_time = 0
+        next_time = 0
         for segment in segment_timeline.findall('mpd:S', ns):
             current_time = int(segment.attrib.get('t', '-1'))
             if current_time == -1:
@@ -254,24 +228,25 @@ class DashDownloader(HasLogger):
             else:
                 next_time = current_time
             next_time += int(segment.attrib.get('d', '0'))
-            if self.download_template(media_template, rep, segment):
-                return True
+            self.download_template(media_template, rep, segment)
 
     def download_template(self, template, representation=None, segment=None):
         dest_filename = self.render_template(template, representation, segment)
         local_filename = dest_filename[dest_filename.rfind('/')+1:]
-        if os.path.isfile(os.path.join(self.proxy.output_dir, local_filename)):
-            self.debug('File %s already exists' % local_filename)
-        else:
+        if not(dest_filename in self.downloaded):
+            self.downloaded.append(dest_filename)
             dest_url = self.full_url(dest_filename)
-            self.debug('requesting %s from %s' % (local_filename, dest_url))
-            r = requests.get(dest_url)
-            if r.status_code >= 200 and r.status_code < 300:
-                self.write(local_filename, r.content)
-            else:
-                self.error('cannot download %s server returned %d' % (dest_url, r.status_code))
-                if r.status_code == 410:
-                    return True
+            threading.Thread(target=self.download, args=(dest_url, local_filename)).start()
+
+    def download(self, dest_url, local_filename):
+        self.info('requesting %s from %s' % (local_filename, dest_url))
+        r = requests.get(dest_url)
+        if r.status_code >= 200 and r.status_code < 300:
+            self.write(local_filename, r.content)
+        else:
+            self.error('cannot download %s server returned %d' % (dest_url, r.status_code))
+            if r.status_code == 410:
+                self.stop = True
 
     def render_template(self, template, representation=None, segment=None):
         template = template.replace('$RepresentationID$', '{representation_id}')
@@ -291,7 +266,7 @@ class DashDownloader(HasLogger):
 
     def write(self, dest, content):
         dest = dest.split('?')[0]
-        dest = os.path.join(self.proxy.output_dir, dest)
+        dest = os.path.join(self.output_dir, dest)
         f = open(dest, 'wb')
         f.write(content)
         f.close()

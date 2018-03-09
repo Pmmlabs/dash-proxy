@@ -13,7 +13,8 @@ import requests
 import xml.etree.ElementTree
 import copy
 
-from requests.exceptions import ConnectionError
+import subprocess
+from requests.exceptions import ConnectionError, Timeout
 from termcolor import colored
 
 logging.VERBOSE = (logging.INFO + logging.DEBUG) // 2
@@ -81,12 +82,13 @@ class MpdLocator(object):
 
 
 class HasLogger(object):
-    def __init__(self):
+    def __init__(self, disable_formatter=False):
         self.logger = logger
         ch = logging.StreamHandler()
         ch.setLevel(logging.DEBUG)
-        formatter = Formatter()
-        ch.setFormatter(formatter)
+        if not disable_formatter:
+            formatter = Formatter()
+            ch.setFormatter(formatter)
         self.logger.addHandler(ch)
         super(HasLogger, self).__init__()
 
@@ -107,8 +109,8 @@ class HasLogger(object):
 
 
 class DashProxy(HasLogger):
-    def __init__(self, mpd, output_dir, download, save_mpds=False, verbose=False):
-        super(DashProxy, self).__init__()
+    def __init__(self, mpd, output_dir, download, save_mpds=False, verbose=False, disable_formatter=False):
+        super(DashProxy, self).__init__(disable_formatter)
         logger.setLevel(logging.VERBOSE if verbose else logging.INFO)
         self.mpd = mpd
         self.output_dir = output_dir
@@ -128,11 +130,11 @@ class DashProxy(HasLogger):
             current_try = 0
             while not success and current_try < max_tries:
                 try:
-                    r = requests.get(self.mpd)
+                    r = requests.get(self.mpd, timeout=1)
                     if r.status_code < 200 or r.status_code >= 300:
                         logger.warning('Cannot GET the MPD. Server returned %s. Retry %d' % (r.status_code, current_try))
-                        current_try += 1
-                except ConnectionError:
+                        raise ConnectionError()
+                except (ConnectionError, Timeout):
                     logger.error('Connection error. Retry %d' % current_try)
                     current_try += 1
                 else:
@@ -150,6 +152,9 @@ class DashProxy(HasLogger):
                         self.stop = True
             if not success:
                 self.stop = True
+        cmd = [os.path.dirname(os.path.abspath(__file__))+'/merge.sh', self.output_dir]
+        subprocess.call(cmd)
+        logger.debug('Executing: "%s"' % ' '.join(cmd))
 
     def get_base_url(self, mpd):
         base_url = baseUrl(self.mpd)
@@ -283,7 +288,8 @@ def run(args):
                       output_dir=args.o,
                       download=args.d,
                       save_mpds=args.save_individual_mpds,
-                      verbose=args.v)
+                      verbose=args.v,
+                      disable_formatter=args.disable_formatter)
     return proxy.run()
 
 
@@ -294,6 +300,7 @@ def main():
     parser.add_argument("-d", action="store_true")
     parser.add_argument("-o", default='.')
     parser.add_argument("--save-individual-mpds", action="store_true")
+    parser.add_argument("--disable-formatter", action="store_true")
     args = parser.parse_args()
 
     run(args)
